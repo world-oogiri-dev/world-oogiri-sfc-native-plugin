@@ -236,11 +236,11 @@ class StraightFaceLandmarkerPlugin :
             }
         }
         stopController(
-            onComplete = {
-                if (replied.get()) return@stopController
+            onComplete = startAfterStop@{
+                if (replied.get()) return@startAfterStop
                 lifecycleBlockedCode?.let { code ->
                     fail("camera_lifecycle_blocked", lifecycleBlockedMessage ?: code)
-                    return@stopController
+                    return@startAfterStop
                 }
                 val currentActivity = activityBinding?.activity
                 val currentLifecycleOwner = currentActivity as? LifecycleOwner
@@ -250,7 +250,7 @@ class StraightFaceLandmarkerPlugin :
                         "invalid_host",
                         "The host Activity must be a LifecycleOwner and the preview must exist",
                     )
-                    return@stopController
+                    return@startAfterStop
                 }
                 val next = StraightFaceCameraController(
                     applicationContext = applicationContext,

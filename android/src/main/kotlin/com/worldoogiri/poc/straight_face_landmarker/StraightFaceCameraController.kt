@@ -148,8 +148,8 @@ internal class StraightFaceCameraController(
             .setResultListener { result, input ->
                 onResult(localGeneration, result, input.width, input.height)
             }
-            .setErrorListener { error ->
-                if (!isCurrent(localGeneration)) return@setErrorListener
+            .setErrorListener errorListener@{ error ->
+                if (!isCurrent(localGeneration)) return@errorListener
                 clearInferenceBusy()
                 sendError("mediapipe_runtime", error.message ?: error.javaClass.simpleName)
             }
@@ -160,11 +160,11 @@ internal class StraightFaceCameraController(
     private fun bindCamera(localGeneration: Long) {
         val providerFuture = ProcessCameraProvider.getInstance(applicationContext)
         providerFuture.addListener(
-            {
-                if (!isCurrent(localGeneration)) return@addListener
+            listener@{
+                if (!isCurrent(localGeneration)) return@listener
                 try {
                     val provider = providerFuture.get()
-                    if (!isCurrent(localGeneration)) return@addListener
+                    if (!isCurrent(localGeneration)) return@listener
                     cameraProvider = provider
                     val preview = Preview.Builder()
                         .setTargetAspectRatio(AspectRatio.RATIO_4_3)
@@ -186,7 +186,7 @@ internal class StraightFaceCameraController(
                     provider.unbindAll()
                     if (!isCurrent(localGeneration)) {
                         analyzer.clearAnalyzer()
-                        return@addListener
+                        return@listener
                     }
                     provider.bindToLifecycle(
                         lifecycleOwner,
