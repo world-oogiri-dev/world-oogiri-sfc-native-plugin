@@ -7,6 +7,8 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Environment
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
 import android.provider.MediaStore
 import androidx.core.app.ActivityCompat
@@ -25,6 +27,7 @@ import io.flutter.plugin.platform.PlatformViewFactory
 import java.util.UUID
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Android-only bridge used by the isolated SFC-A PoC.
@@ -43,13 +46,20 @@ class StraightFaceLandmarkerPlugin :
     private lateinit var methodChannel: MethodChannel
     private lateinit var eventChannel: EventChannel
     private var eventSink: EventChannel.EventSink? = null
+    private var eventSinkAttached = false
+    private var eventSinkGeneration = 0L
     private var activityBinding: ActivityPluginBinding? = null
     private var preview: StraightFaceCameraPlatformView? = null
     private var controller: StraightFaceCameraController? = null
     private var pendingStart: PendingStart? = null
+    private var cameraStartInFlight = false
     private var pendingEvidenceSave: PendingEvidenceSave? = null
     private var claimedEvidence: ClaimedEvidence? = null
     private var lastMetrics: Map<String, Any> = emptyMap()
+    private var nextControllerGeneration = 0L
+    private var lifecycleBlockedCode: String? = null
+    private var lifecycleBlockedMessage: String? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
     private val saveExecutor: ExecutorService = Executors.newSingleThreadExecutor()
 
     override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
@@ -102,10 +112,14 @@ class StraightFaceLandmarkerPlugin :
 
     override fun onListen(arguments: Any?, events: EventChannel.EventSink) {
         eventSink = events
+        eventSinkAttached = true
+        eventSinkGeneration += 1
     }
 
     override fun onCancel(arguments: Any?) {
         eventSink = null
+        eventSinkAttached = false
+        eventSinkGeneration += 1
     }
 
     override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
@@ -114,11 +128,10 @@ class StraightFaceLandmarkerPlugin :
                 preview != null && activityBinding?.activity != null,
             )
             "startCamera" -> startCamera(call, result)
-            "stopCamera" -> {
-                val metrics = controller?.metrics() ?: lastMetrics
-                stopController()
-                result.success(metrics)
-            }
+            "stopCamera" -> stopController(
+                onComplete = { metrics -> result.success(metrics) },
+                onFailure = { code, message -> result.error(code, message, null) },
+            )
             "monotonicNowMs" -> result.success(SystemClock.elapsedRealtime())
             "claimFrameJpeg" -> {
                 val timestamp = call.argument<Number>("frameTimestampMs")?.toLong()
@@ -142,7 +155,7 @@ class StraightFaceLandmarkerPlugin :
                 controller?.discardCompletedFrames()
                 result.success(null)
             }
-            "getMetrics" -> result.success(controller?.metrics() ?: lastMetrics)
+            "getMetrics" -> result.success(currentMetrics())
             else -> result.notImplemented()
         }
     }
@@ -151,6 +164,14 @@ class StraightFaceLandmarkerPlugin :
         val sessionId = call.argument<String>("sessionId")
         if (sessionId.isNullOrBlank()) {
             result.error("invalid_argument", "sessionId is required", null)
+            return
+        }
+        lifecycleBlockedCode?.let { code ->
+            result.error(
+                "camera_lifecycle_blocked",
+                lifecycleBlockedMessage ?: code,
+                currentMetrics(),
+            )
             return
         }
         val activity = activityBinding?.activity
@@ -181,6 +202,10 @@ class StraightFaceLandmarkerPlugin :
     }
 
     private fun startController(sessionId: String, result: MethodChannel.Result) {
+        if (cameraStartInFlight) {
+            result.error("camera_start_in_progress", "A camera start is already in progress", null)
+            return
+        }
         val activity = activityBinding?.activity
         val lifecycleOwner = activity as? LifecycleOwner
         val activePreview = preview
@@ -195,17 +220,65 @@ class StraightFaceLandmarkerPlugin :
         if (claimedEvidence?.sessionId != null && claimedEvidence?.sessionId != sessionId) {
             discardClaimedEvidence()
         }
-        stopController()
-        val next = StraightFaceCameraController(
-            applicationContext = applicationContext,
-            activity = activity,
-            lifecycleOwner = lifecycleOwner,
-            previewView = activePreview.previewView,
-            emit = ::emit,
+        cameraStartInFlight = true
+        val replied = AtomicBoolean(false)
+        fun fail(code: String, message: String) {
+            if (replied.compareAndSet(false, true)) {
+                cameraStartInFlight = false
+                result.error(code, message, currentMetrics())
+            }
+        }
+        fun succeed(metrics: Map<String, Any>) {
+            if (replied.compareAndSet(false, true)) {
+                cameraStartInFlight = false
+                result.success(metrics)
+            }
+        }
+        stopController(
+            onComplete = {
+                if (replied.get()) return@stopController
+                lifecycleBlockedCode?.let { code ->
+                    fail("camera_lifecycle_blocked", lifecycleBlockedMessage ?: code)
+                    return@stopController
+                }
+                val currentActivity = activityBinding?.activity
+                val currentLifecycleOwner = currentActivity as? LifecycleOwner
+                val currentPreview = preview
+                if (currentActivity == null || currentLifecycleOwner == null || currentPreview == null) {
+                    fail(
+                        "invalid_host",
+                        "The host Activity must be a LifecycleOwner and the preview must exist",
+                    )
+                    return@stopController
+                }
+                val next = StraightFaceCameraController(
+                    applicationContext = applicationContext,
+                    activity = currentActivity,
+                    lifecycleOwner = currentLifecycleOwner,
+                    previewView = currentPreview.previewView,
+                    controllerGeneration = ++nextControllerGeneration,
+                    emit = ::emit,
+                )
+                controller = next
+                next.start(
+                    newSessionId = sessionId,
+                    onReady = { metrics ->
+                        lastMetrics = metrics
+                        succeed(metrics)
+                    },
+                    onFailure = { code, message ->
+                        lastMetrics = next.metrics()
+                        if (lastMetrics["lifecycleState"] == "stop_failed") {
+                            lifecycleBlockedCode = code
+                            lifecycleBlockedMessage = message
+                        }
+                        if (controller === next) controller = null
+                        fail(code, message)
+                    },
+                )
+            },
+            onFailure = { code, message -> fail(code, message) },
         )
-        controller = next
-        next.start(sessionId)
-        result.success(null)
     }
 
     override fun onRequestPermissionsResult(
@@ -450,11 +523,47 @@ class StraightFaceLandmarkerPlugin :
             }
     }
 
-    private fun stopController() {
-        val active = controller ?: return
-        lastMetrics = active.metrics()
-        active.stop()
-        controller = null
+    private fun stopController(
+        onComplete: (Map<String, Any>) -> Unit = {},
+        onFailure: (String, String) -> Unit = { _, _ -> },
+    ) {
+        val active = controller
+        if (active == null) {
+            val blockedCode = lifecycleBlockedCode
+            if (blockedCode != null) {
+                mainHandler.post {
+                    onFailure(blockedCode, lifecycleBlockedMessage ?: blockedCode)
+                }
+            } else {
+                mainHandler.post { onComplete(currentMetrics()) }
+            }
+            return
+        }
+        active.stop { outcome ->
+            lastMetrics = outcome.metrics
+            if (controller === active) controller = null
+            if (outcome.errorCode == null) {
+                onComplete(currentMetrics())
+            } else {
+                lifecycleBlockedCode = outcome.errorCode
+                lifecycleBlockedMessage = outcome.errorMessage
+                onFailure(
+                    outcome.errorCode,
+                    outcome.errorMessage ?: outcome.errorCode,
+                )
+            }
+        }
+    }
+
+    private fun currentMetrics(): Map<String, Any> {
+        val base = controller?.metrics() ?: lastMetrics
+        return base + mapOf(
+            "nativeVersion" to StraightFaceCameraController.NATIVE_VERSION,
+            "pluginLifecycleBlocked" to (lifecycleBlockedCode != null),
+            "pluginLifecycleBlockCode" to (lifecycleBlockedCode ?: ""),
+            "eventSinkAttached" to eventSinkAttached,
+            "eventSinkGeneration" to eventSinkGeneration,
+        )
     }
 
     private fun emit(event: Map<String, Any?>) {

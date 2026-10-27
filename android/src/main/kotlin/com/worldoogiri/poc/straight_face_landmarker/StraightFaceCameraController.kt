@@ -29,6 +29,7 @@ import java.io.ByteArrayOutputStream
 import java.util.LinkedHashMap
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.atan2
@@ -39,11 +40,15 @@ internal class StraightFaceCameraController(
     private val activity: Activity,
     private val lifecycleOwner: LifecycleOwner,
     private val previewView: PreviewView,
+    private val controllerGeneration: Long,
     private val emit: (Map<String, Any?>) -> Unit,
 ) {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val analysisExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+    private val teardownExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+    private val stateLock = Any()
     private val inferenceBusy = AtomicBoolean(false)
+    private val watchdogTriggered = AtomicBoolean(false)
     private val cameraFrames = AtomicLong(0)
     private val submittedFrames = AtomicLong(0)
     private val droppedBusyFrames = AtomicLong(0)
@@ -51,6 +56,9 @@ internal class StraightFaceCameraController(
     private val noFaceFrames = AtomicLong(0)
     private val inferenceTotalMs = AtomicLong(0)
     private val maxInferenceMs = AtomicLong(0)
+    private val inferenceStartedAtMs = AtomicLong(0)
+    private val lastMediaPipeCallbackAtMs = AtomicLong(0)
+    private val watchdogCount = AtomicLong(0)
     private val pendingFrames = LinkedHashMap<Long, PendingFrame>()
     private val completedFrames = LinkedHashMap<Long, Bitmap>()
     private val evidenceFrames = LinkedHashMap<Long, EvidenceFrame>()
@@ -61,26 +69,65 @@ internal class StraightFaceCameraController(
     @Volatile private var generation = 0L
     @Volatile private var lastFrameTimestampMs = 0L
     @Volatile private var cameraProvider: ProcessCameraProvider? = null
+    @Volatile private var imageAnalysis: ImageAnalysis? = null
     @Volatile private var faceLandmarker: FaceLandmarker? = null
+    @Volatile private var lifecycleState = "created"
+    @Volatile private var cameraBound = false
+    private var stopStarted = false
+    private var stopOutcome: StopOutcome? = null
+    private val stopCallbacks = mutableListOf<(StopOutcome) -> Unit>()
+    private var startOutcome: StartOutcome? = null
+    private var startCallback: ((StartOutcome) -> Unit)? = null
     private var baselinePssKb = 0L
     private var startedAtMs = 0L
 
-    fun start(newSessionId: String) {
+    fun start(
+        newSessionId: String,
+        onReady: (Map<String, Any>) -> Unit,
+        onFailure: (String, String) -> Unit,
+    ) {
+        synchronized(stateLock) {
+            if (stopStarted) {
+                mainHandler.post {
+                    onFailure("camera_start_cancelled", "Camera was stopped before start completed")
+                }
+                return
+            }
+            startCallback = { outcome ->
+                if (outcome.errorCode == null) {
+                    onReady(outcome.metrics)
+                } else {
+                    onFailure(
+                        outcome.errorCode,
+                        outcome.errorMessage ?: outcome.errorCode,
+                    )
+                }
+            }
+        }
         sessionId = newSessionId
         active = true
         generation += 1
         val localGeneration = generation
+        lifecycleState = "starting"
         baselinePssKb = Debug.getPss()
         startedAtMs = SystemClock.elapsedRealtime()
         analysisExecutor.execute {
             if (!isCurrent(localGeneration)) return@execute
             try {
-                faceLandmarker = createFaceLandmarker(localGeneration)
+                val created = createFaceLandmarker(localGeneration)
+                if (!isCurrent(localGeneration)) {
+                    created.close()
+                    return@execute
+                }
+                faceLandmarker = created
                 mainHandler.post {
                     if (isCurrent(localGeneration)) bindCamera(localGeneration)
                 }
             } catch (error: RuntimeException) {
-                sendError("mediapipe_initialization", error.message ?: error.javaClass.simpleName)
+                failStart(
+                    "mediapipe_initialization",
+                    error.message ?: error.javaClass.simpleName,
+                )
             }
         }
     }
@@ -102,7 +149,8 @@ internal class StraightFaceCameraController(
                 onResult(localGeneration, result, input.width, input.height)
             }
             .setErrorListener { error ->
-                inferenceBusy.set(false)
+                if (!isCurrent(localGeneration)) return@setErrorListener
+                clearInferenceBusy()
                 sendError("mediapipe_runtime", error.message ?: error.javaClass.simpleName)
             }
             .build()
@@ -116,6 +164,7 @@ internal class StraightFaceCameraController(
                 if (!isCurrent(localGeneration)) return@addListener
                 try {
                     val provider = providerFuture.get()
+                    if (!isCurrent(localGeneration)) return@addListener
                     cameraProvider = provider
                     val preview = Preview.Builder()
                         .setTargetAspectRatio(AspectRatio.RATIO_4_3)
@@ -132,23 +181,34 @@ internal class StraightFaceCameraController(
                             imageAnalysis.setAnalyzer(analysisExecutor) { image ->
                                 analyze(localGeneration, image)
                             }
+                            this.imageAnalysis = imageAnalysis
                         }
                     provider.unbindAll()
+                    if (!isCurrent(localGeneration)) {
+                        analyzer.clearAnalyzer()
+                        return@addListener
+                    }
                     provider.bindToLifecycle(
                         lifecycleOwner,
                         CameraSelector.DEFAULT_FRONT_CAMERA,
                         preview,
                         analyzer,
                     )
+                    cameraBound = true
+                    lifecycleState = "ready"
+                    completeStart(StartOutcome(metrics = metrics()))
                     emit(
                         mapOf(
                             "kind" to "camera_started",
                             "sessionId" to sessionId,
                             "timestampMs" to SystemClock.elapsedRealtime(),
+                            "nativeVersion" to NATIVE_VERSION,
+                            "controllerGeneration" to controllerGeneration,
+                            "lifecycleState" to lifecycleState,
                         ),
                     )
                 } catch (error: Exception) {
-                    sendError("camera_binding", error.message ?: error.javaClass.simpleName)
+                    failStart("camera_binding", error.message ?: error.javaClass.simpleName)
                 }
             },
             ContextCompat.getMainExecutor(activity),
@@ -159,6 +219,26 @@ internal class StraightFaceCameraController(
         cameraFrames.incrementAndGet()
         if (!isCurrent(localGeneration)) {
             imageProxy.close()
+            return
+        }
+        if (inferenceBusy.get()) {
+            droppedBusyFrames.incrementAndGet()
+            imageProxy.close()
+            val busySince = inferenceStartedAtMs.get()
+            val busyForMs = (SystemClock.elapsedRealtime() - busySince).coerceAtLeast(0)
+            if (busySince > 0 && busyForMs >= CALLBACK_WATCHDOG_TIMEOUT_MS &&
+                watchdogTriggered.compareAndSet(false, true)
+            ) {
+                watchdogCount.incrementAndGet()
+                lifecycleState = "callback_timeout"
+                sendError(
+                    "mediapipe_callback_timeout",
+                    "MediaPipe callback did not return for ${busyForMs}ms",
+                )
+                // Do not clear inferenceBusy here. The active Landmarker is
+                // torn down instead, so no second detectAsync can overlap it.
+                stop()
+            }
             return
         }
         if (!inferenceBusy.compareAndSet(false, true)) {
@@ -205,12 +285,13 @@ internal class StraightFaceCameraController(
                 )
             }
             submittedFrames.incrementAndGet()
+            inferenceStartedAtMs.set(SystemClock.elapsedRealtime())
             val mpImage = BitmapImageBuilder(rotatedBitmap).build()
             faceLandmarker?.detectAsync(mpImage, frameTimestamp)
                 ?: throw IllegalStateException("FaceLandmarker is not initialized")
         } catch (error: Exception) {
             imageProxy.close()
-            inferenceBusy.set(false)
+            clearInferenceBusy()
             rotatedBitmap?.let { bitmap ->
                 synchronized(pendingFrames) {
                     pendingFrames.entries.removeIf { entry -> entry.value.bitmap === bitmap }
@@ -229,12 +310,12 @@ internal class StraightFaceCameraController(
     ) {
         val resultAtMs = SystemClock.elapsedRealtime()
         val timestamp = result.timestampMs()
-        inferenceBusy.set(false)
         val pendingFrame = synchronized(pendingFrames) { pendingFrames.remove(timestamp) }
         if (!isCurrent(localGeneration)) {
             pendingFrame?.bitmap?.recycleSafely()
             return
         }
+        clearInferenceBusy(resultAtMs)
         pendingFrame?.bitmap?.let { retainCompletedFrame(timestamp, it) }
         val inferenceMs = (resultAtMs - timestamp).coerceAtLeast(0)
         resultFrames.incrementAndGet()
@@ -278,6 +359,7 @@ internal class StraightFaceCameraController(
                 "droppedBusyFrameCount" to droppedBusyFrames.get(),
                 "resultFrameCount" to resultFrames.get(),
                 "pssKb" to Debug.getPss(),
+                "controllerGeneration" to controllerGeneration,
             ),
         )
     }
@@ -551,7 +633,24 @@ internal class StraightFaceCameraController(
     fun metrics(): Map<String, Any> {
         val results = resultFrames.get()
         val currentPss = Debug.getPss()
+        val now = SystemClock.elapsedRealtime()
+        val busySince = inferenceStartedAtMs.get()
         return mapOf(
+            "nativeVersion" to NATIVE_VERSION,
+            "controllerGeneration" to controllerGeneration,
+            "lifecycleState" to lifecycleState,
+            "cameraBound" to cameraBound,
+            "analysisBound" to (imageAnalysis != null),
+            "inferenceBusy" to inferenceBusy.get(),
+            "inferenceBusyForMs" to if (inferenceBusy.get() && busySince > 0) {
+                (now - busySince).coerceAtLeast(0)
+            } else {
+                0L
+            },
+            "lastMediaPipeCallbackAgeMs" to lastMediaPipeCallbackAtMs.get().let { callbackAt ->
+                if (callbackAt > 0) (now - callbackAt).coerceAtLeast(0) else -1L
+            },
+            "watchdogCount" to watchdogCount.get(),
             "sessionId" to sessionId,
             "cameraFrames" to cameraFrames.get(),
             "submittedFrames" to submittedFrames.get(),
@@ -572,40 +671,207 @@ internal class StraightFaceCameraController(
         )
     }
 
-    fun stop() {
-        if (!active) return
-        active = false
-        generation += 1
-        cameraProvider?.unbindAll()
-        cameraProvider = null
-        analysisExecutor.execute {
-            try {
-                faceLandmarker?.close()
-            } finally {
-                faceLandmarker = null
-                synchronized(pendingFrames) {
-                    pendingFrames.values.forEach { it.bitmap.recycleSafely() }
-                    pendingFrames.clear()
-                }
-                synchronized(completedFrames) {
-                    completedFrames.values.forEach { it.recycleSafely() }
-                    completedFrames.clear()
-                }
-                synchronized(evidenceFrames) {
-                    evidenceFrames.values.forEach { it.bitmap.recycleSafely() }
-                    evidenceFrames.clear()
-                    evidenceCandidateTimestamps.clear()
-                }
+    fun stop(callback: ((StopOutcome) -> Unit)? = null) {
+        var immediate: StopOutcome? = null
+        synchronized(stateLock) {
+            stopOutcome?.let { completed ->
+                immediate = completed
+                return@synchronized
+            }
+            if (callback != null) stopCallbacks.add(callback)
+            if (stopStarted) return@synchronized
+            stopStarted = true
+            active = false
+            generation += 1
+            lifecycleState = "stopping"
+            if (startOutcome == null) {
+                startOutcome = StartOutcome(
+                    errorCode = "camera_start_cancelled",
+                    errorMessage = "Camera was stopped before start completed",
+                )
             }
         }
-        analysisExecutor.shutdown()
-        emit(
-            mapOf(
-                "kind" to "camera_stopped",
-                "sessionId" to sessionId,
-                "timestampMs" to SystemClock.elapsedRealtime(),
-            ),
-        )
+        if (immediate != null) {
+            mainHandler.post { callback?.invoke(immediate) }
+            return
+        }
+        beginStop()
+    }
+
+    private fun beginStop() {
+        mainHandler.post {
+            var unbindFailure: Throwable? = null
+            try {
+                imageAnalysis?.clearAnalyzer()
+                imageAnalysis = null
+                cameraProvider?.unbindAll()
+                cameraProvider = null
+                cameraBound = false
+            } catch (error: Throwable) {
+                unbindFailure = error
+            }
+            closeLandmarkerAndAwaitTermination(unbindFailure)
+        }
+    }
+
+    private fun closeLandmarkerAndAwaitTermination(unbindFailure: Throwable?) {
+        try {
+            analysisExecutor.execute {
+                var closeFailure: Throwable? = null
+                try {
+                    faceLandmarker?.close()
+                } catch (error: Throwable) {
+                    closeFailure = error
+                } finally {
+                    faceLandmarker = null
+                    clearInferenceBusy()
+                    recycleFrameBuffers()
+                }
+                try {
+                    analysisExecutor.shutdown()
+                    teardownExecutor.execute {
+                        val outcome = try {
+                            val terminated = analysisExecutor.awaitTermination(
+                                STOP_TERMINATION_TIMEOUT_MS,
+                                TimeUnit.MILLISECONDS,
+                            )
+                            when {
+                                !terminated -> StopOutcome(
+                                    metrics = metrics(),
+                                    errorCode = "camera_teardown_timeout",
+                                    errorMessage = "Camera analysis did not terminate within ${STOP_TERMINATION_TIMEOUT_MS}ms",
+                                )
+                                unbindFailure != null -> StopOutcome(
+                                    metrics = metrics(),
+                                    errorCode = "camera_unbind_failed",
+                                    errorMessage = unbindFailure.message
+                                        ?: unbindFailure.javaClass.simpleName,
+                                )
+                                closeFailure != null -> StopOutcome(
+                                    metrics = metrics(),
+                                    errorCode = "mediapipe_close_failed",
+                                    errorMessage = closeFailure.message
+                                        ?: closeFailure.javaClass.simpleName,
+                                )
+                                else -> StopOutcome(metrics = metrics())
+                            }
+                        } catch (error: InterruptedException) {
+                            Thread.currentThread().interrupt()
+                            StopOutcome(
+                                metrics = metrics(),
+                                errorCode = "camera_teardown_interrupted",
+                                errorMessage = error.message ?: error.javaClass.simpleName,
+                            )
+                        } catch (error: Throwable) {
+                            StopOutcome(
+                                metrics = metrics(),
+                                errorCode = "camera_teardown_failed",
+                                errorMessage = error.message ?: error.javaClass.simpleName,
+                            )
+                        }
+                        completeStop(outcome)
+                    }
+                    teardownExecutor.shutdown()
+                } catch (error: Throwable) {
+                    completeStop(
+                        StopOutcome(
+                            metrics = metrics(),
+                            errorCode = "camera_teardown_failed",
+                            errorMessage = error.message ?: error.javaClass.simpleName,
+                        ),
+                    )
+                }
+            }
+        } catch (error: Throwable) {
+            completeStop(
+                StopOutcome(
+                    metrics = metrics(),
+                    errorCode = "camera_teardown_failed",
+                    errorMessage = error.message ?: error.javaClass.simpleName,
+                ),
+            )
+        }
+    }
+
+    private fun recycleFrameBuffers() {
+        synchronized(pendingFrames) {
+            pendingFrames.values.forEach { it.bitmap.recycleSafely() }
+            pendingFrames.clear()
+        }
+        synchronized(completedFrames) {
+            completedFrames.values.forEach { it.recycleSafely() }
+            completedFrames.clear()
+        }
+        synchronized(evidenceFrames) {
+            evidenceFrames.values.forEach { it.bitmap.recycleSafely() }
+            evidenceFrames.clear()
+            evidenceCandidateTimestamps.clear()
+        }
+    }
+
+    private fun completeStop(outcome: StopOutcome) {
+        val callbacks: List<(StopOutcome) -> Unit>
+        val pendingStart: ((StartOutcome) -> Unit)?
+        synchronized(stateLock) {
+            if (stopOutcome != null) return
+            stopOutcome = outcome
+            lifecycleState = if (outcome.errorCode == null) "stopped" else "stop_failed"
+            callbacks = stopCallbacks.toList()
+            stopCallbacks.clear()
+            pendingStart = if (startOutcome != null && startCallback != null) {
+                val callback = startCallback
+                startCallback = null
+                callback
+            } else {
+                null
+            }
+        }
+        if (outcome.errorCode == null) {
+            emit(
+                mapOf(
+                    "kind" to "camera_stopped",
+                    "sessionId" to sessionId,
+                    "timestampMs" to SystemClock.elapsedRealtime(),
+                    "nativeVersion" to NATIVE_VERSION,
+                    "controllerGeneration" to controllerGeneration,
+                    "lifecycleState" to lifecycleState,
+                ),
+            )
+        } else {
+            sendError(outcome.errorCode, outcome.errorMessage ?: outcome.errorCode)
+        }
+        mainHandler.post {
+            pendingStart?.invoke(startOutcome ?: StartOutcome(metrics = metrics()))
+            callbacks.forEach { it(outcome) }
+        }
+    }
+
+    private fun completeStart(outcome: StartOutcome) {
+        val callback: ((StartOutcome) -> Unit)?
+        synchronized(stateLock) {
+            if (startOutcome != null) return
+            startOutcome = outcome
+            callback = startCallback
+            startCallback = null
+        }
+        mainHandler.post { callback?.invoke(outcome) }
+    }
+
+    private fun failStart(code: String, message: String) {
+        if (!isCurrent(generation)) return
+        sendError(code, message)
+        synchronized(stateLock) {
+            if (startOutcome == null) {
+                startOutcome = StartOutcome(errorCode = code, errorMessage = message)
+            }
+        }
+        stop()
+    }
+
+    private fun clearInferenceBusy(nowMs: Long = SystemClock.elapsedRealtime()) {
+        inferenceBusy.set(false)
+        inferenceStartedAtMs.set(0)
+        lastMediaPipeCallbackAtMs.set(nowMs)
     }
 
     private fun isCurrent(localGeneration: Long): Boolean {
@@ -620,6 +886,9 @@ internal class StraightFaceCameraController(
                 "code" to code,
                 "message" to message,
                 "timestampMs" to SystemClock.elapsedRealtime(),
+                "nativeVersion" to NATIVE_VERSION,
+                "controllerGeneration" to controllerGeneration,
+                "lifecycleState" to lifecycleState,
             ),
         )
     }
@@ -708,7 +977,22 @@ internal class StraightFaceCameraController(
         val legacyAperture: Double,
     )
 
+    data class StopOutcome(
+        val metrics: Map<String, Any>,
+        val errorCode: String? = null,
+        val errorMessage: String? = null,
+    )
+
+    private data class StartOutcome(
+        val metrics: Map<String, Any> = emptyMap(),
+        val errorCode: String? = null,
+        val errorMessage: String? = null,
+    )
+
     companion object {
+        const val NATIVE_VERSION = "SFC-R4-20261027-native-lifecycle-fix"
+        private const val CALLBACK_WATCHDOG_TIMEOUT_MS = 10000L
+        private const val STOP_TERMINATION_TIMEOUT_MS = 10000L
         private const val MODEL_ASSET = "face_landmarker.task"
         private const val MAX_COMPLETED_FRAMES = 6
         private const val MAX_EVIDENCE_CANDIDATES = 8
