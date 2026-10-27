@@ -81,6 +81,7 @@ class StraightFaceLandmarkerPlugin :
         methodChannel.setMethodCallHandler(null)
         eventChannel.setStreamHandler(null)
         eventSink = null
+        eventSinkAttached = false
     }
 
     override fun onAttachedToActivity(binding: ActivityPluginBinding) {
