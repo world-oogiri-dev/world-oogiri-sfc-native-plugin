@@ -148,7 +148,7 @@ class StraightFaceLandmarkerPlugin :
                 reason = when (call.argument<String>("stopSource")) {
                     NativeStopSource.DART_STOP_CAMERA -> "dart_stop_camera"
                     NativeStopSource.RUNTIME_RELEASE -> "runtime_release"
-                    else -> "unknown_dart_stop",
+                    else -> "unknown_dart_stop"
                 },
                 onComplete = { metrics -> result.success(metrics) },
                 onFailure = { code, message -> result.error(code, message, null) },
