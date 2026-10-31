@@ -41,6 +41,8 @@ internal class StraightFaceCameraController(
     private val lifecycleOwner: LifecycleOwner,
     private val previewView: PreviewView,
     private val controllerGeneration: Long,
+    private val dartStartAttempt: Long,
+    private val dartLeaseGeneration: Long,
     private val emit: (Map<String, Any?>) -> Unit,
 ) {
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -78,6 +80,7 @@ internal class StraightFaceCameraController(
     private val stopCallbacks = mutableListOf<(StopOutcome) -> Unit>()
     private var startOutcome: StartOutcome? = null
     private var startCallback: ((StartOutcome) -> Unit)? = null
+    private val firstStopRequest = FirstNativeStopRequest()
     private var baselinePssKb = 0L
     private var startedAtMs = 0L
 
@@ -237,7 +240,10 @@ internal class StraightFaceCameraController(
                 )
                 // Do not clear inferenceBusy here. The active Landmarker is
                 // torn down instead, so no second detectAsync can overlap it.
-                stop()
+                stop(
+                    source = NativeStopSource.WATCHDOG_STOP,
+                    reason = "mediapipe_callback_watchdog",
+                )
             }
             return
         }
@@ -668,11 +674,16 @@ internal class StraightFaceCameraController(
             "evidenceCandidateCount" to synchronized(evidenceFrames) {
                 evidenceCandidateTimestamps.size
             },
-        )
+        ) + (firstStopRequest.snapshot()?.toMetrics() ?: emptyMap())
     }
 
-    fun stop(callback: ((StopOutcome) -> Unit)? = null) {
+    fun stop(
+        source: String = NativeStopSource.UNKNOWN,
+        reason: String = "unknown",
+        callback: ((StopOutcome) -> Unit)? = null,
+    ) {
         var immediate: StopOutcome? = null
+        var firstRequestToEmit: NativeStopRequest? = null
         synchronized(stateLock) {
             stopOutcome?.let { completed ->
                 immediate = completed
@@ -680,6 +691,7 @@ internal class StraightFaceCameraController(
             }
             if (callback != null) stopCallbacks.add(callback)
             if (stopStarted) return@synchronized
+            firstRequestToEmit = recordStopRequestLocked(source, reason)
             stopStarted = true
             active = false
             generation += 1
@@ -695,7 +707,49 @@ internal class StraightFaceCameraController(
             mainHandler.post { callback?.invoke(immediate) }
             return
         }
+        firstRequestToEmit?.let(::emitStopRequestSafely)
         beginStop()
+    }
+
+    /** Records an entry-point request without changing camera state or order. */
+    fun recordStopRequest(source: String, reason: String) {
+        val first = synchronized(stateLock) {
+            recordStopRequestLocked(source, reason)
+        }
+        first?.let(::emitStopRequestSafely)
+    }
+
+    private fun recordStopRequestLocked(source: String, reason: String): NativeStopRequest? {
+        val now = SystemClock.elapsedRealtime()
+        return firstStopRequest.recordIfAbsent(
+            NativeStopRequest(
+                source = source,
+                reason = reason,
+                controllerGeneration = controllerGeneration,
+                nativeLifecycle = lifecycleState,
+                startInFlight = startOutcome == null,
+                requestedElapsedMs = if (startedAtMs > 0L) {
+                    (now - startedAtMs).coerceAtLeast(0L)
+                } else {
+                    -1L
+                },
+                dartStartAttempt = dartStartAttempt,
+                dartLeaseGeneration = dartLeaseGeneration,
+            ),
+        )
+    }
+
+    private fun emitStopRequestSafely(request: NativeStopRequest) {
+        runCatching {
+            emit(
+                mapOf(
+                    "kind" to "native_stop_requested",
+                    "sessionId" to sessionId,
+                    "timestampMs" to SystemClock.elapsedRealtime(),
+                    "nativeVersion" to NATIVE_VERSION,
+                ) + request.toMetrics(),
+            )
+        }
     }
 
     private fun beginStop() {
@@ -865,7 +919,12 @@ internal class StraightFaceCameraController(
                 startOutcome = StartOutcome(errorCode = code, errorMessage = message)
             }
         }
-        stop()
+        val source = when (code) {
+            "mediapipe_initialization" -> NativeStopSource.CAMERA_INITIALIZATION_FAILURE
+            "camera_binding" -> NativeStopSource.CAMERA_BIND_FAILURE
+            else -> NativeStopSource.UNKNOWN
+        }
+        stop(source = source, reason = code)
     }
 
     private fun clearInferenceBusy(nowMs: Long = SystemClock.elapsedRealtime()) {
@@ -990,7 +1049,7 @@ internal class StraightFaceCameraController(
     )
 
     companion object {
-        const val NATIVE_VERSION = "SFC-R4-20261027-native-lifecycle-fix"
+        const val NATIVE_VERSION = "SFC-R5-20261101-native-stop-source"
         private const val CALLBACK_WATCHDOG_TIMEOUT_MS = 10000L
         private const val STOP_TERMINATION_TIMEOUT_MS = 10000L
         private const val MODEL_ASSET = "face_landmarker.task"

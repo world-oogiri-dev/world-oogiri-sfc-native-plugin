@@ -75,7 +75,10 @@ class StraightFaceLandmarkerPlugin :
     }
 
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
-        stopController()
+        stopController(
+            source = NativeStopSource.ENGINE_DETACH,
+            reason = "flutter_engine_detached",
+        )
         discardClaimedEvidence()
         saveExecutor.shutdown()
         methodChannel.setMethodCallHandler(null)
@@ -90,7 +93,11 @@ class StraightFaceLandmarkerPlugin :
     }
 
     override fun onDetachedFromActivityForConfigChanges() {
-        detachActivity("Activity recreated during camera session")
+        detachActivity(
+            message = "Activity recreated during camera session",
+            source = NativeStopSource.CONFIG_CHANGE,
+            reason = "activity_config_change",
+        )
     }
 
     override fun onReattachedToActivityForConfigChanges(binding: ActivityPluginBinding) {
@@ -98,17 +105,24 @@ class StraightFaceLandmarkerPlugin :
     }
 
     override fun onDetachedFromActivity() {
-        detachActivity("Activity detached during camera session")
+        detachActivity(
+            message = "Activity detached during camera session",
+            source = NativeStopSource.ACTIVITY_DETACH,
+            reason = "activity_detached",
+        )
     }
 
-    private fun detachActivity(message: String) {
+    private fun detachActivity(message: String, source: String, reason: String) {
         pendingStart?.result?.error("activity_detached", message, null)
         pendingStart = null
         pendingEvidenceSave?.result?.error("activity_detached", message, null)
         pendingEvidenceSave = null
+        // Capture and emit the factual entry point while the Activity-backed
+        // EventSink is still available. This does not stop or reorder CameraX.
+        controller?.recordStopRequest(source, reason)
         activityBinding?.removeRequestPermissionsResultListener(this)
         activityBinding = null
-        stopController()
+        stopController(source = source, reason = reason)
     }
 
     override fun onListen(arguments: Any?, events: EventChannel.EventSink) {
@@ -130,6 +144,12 @@ class StraightFaceLandmarkerPlugin :
             )
             "startCamera" -> startCamera(call, result)
             "stopCamera" -> stopController(
+                source = NativeStopSource.fromDart(call.argument<String>("stopSource")),
+                reason = when (call.argument<String>("stopSource")) {
+                    NativeStopSource.DART_STOP_CAMERA -> "dart_stop_camera"
+                    NativeStopSource.RUNTIME_RELEASE -> "runtime_release"
+                    else -> "unknown_dart_stop",
+                },
                 onComplete = { metrics -> result.success(metrics) },
                 onFailure = { code, message -> result.error(code, message, null) },
             )
@@ -163,6 +183,8 @@ class StraightFaceLandmarkerPlugin :
 
     private fun startCamera(call: MethodCall, result: MethodChannel.Result) {
         val sessionId = call.argument<String>("sessionId")
+        val dartStartAttempt = call.argument<Number>("startAttempt")?.toLong() ?: 0L
+        val dartLeaseGeneration = call.argument<Number>("leaseGeneration")?.toLong() ?: 0L
         if (sessionId.isNullOrBlank()) {
             result.error("invalid_argument", "sessionId is required", null)
             return
@@ -191,7 +213,12 @@ class StraightFaceLandmarkerPlugin :
                 result.error("permission_pending", "A camera permission request is already active", null)
                 return
             }
-            pendingStart = PendingStart(sessionId, result)
+            pendingStart = PendingStart(
+                sessionId,
+                result,
+                dartStartAttempt,
+                dartLeaseGeneration,
+            )
             ActivityCompat.requestPermissions(
                 activity,
                 arrayOf(Manifest.permission.CAMERA),
@@ -199,10 +226,15 @@ class StraightFaceLandmarkerPlugin :
             )
             return
         }
-        startController(sessionId, result)
+        startController(sessionId, result, dartStartAttempt, dartLeaseGeneration)
     }
 
-    private fun startController(sessionId: String, result: MethodChannel.Result) {
+    private fun startController(
+        sessionId: String,
+        result: MethodChannel.Result,
+        dartStartAttempt: Long,
+        dartLeaseGeneration: Long,
+    ) {
         if (cameraStartInFlight) {
             result.error("camera_start_in_progress", "A camera start is already in progress", null)
             return
@@ -236,6 +268,8 @@ class StraightFaceLandmarkerPlugin :
             }
         }
         stopController(
+            source = NativeStopSource.START_CAMERA_REPLACEMENT,
+            reason = "start_camera_replacement",
             onComplete = startAfterStop@{
                 if (replied.get()) return@startAfterStop
                 lifecycleBlockedCode?.let { code ->
@@ -258,6 +292,8 @@ class StraightFaceLandmarkerPlugin :
                     lifecycleOwner = currentLifecycleOwner,
                     previewView = currentPreview.previewView,
                     controllerGeneration = ++nextControllerGeneration,
+                    dartStartAttempt = dartStartAttempt,
+                    dartLeaseGeneration = dartLeaseGeneration,
                     emit = ::emit,
                 )
                 controller = next
@@ -322,7 +358,12 @@ class StraightFaceLandmarkerPlugin :
             )
             return true
         }
-        startController(pending.sessionId, pending.result)
+        startController(
+            pending.sessionId,
+            pending.result,
+            pending.dartStartAttempt,
+            pending.dartLeaseGeneration,
+        )
         return true
     }
 
@@ -525,6 +566,8 @@ class StraightFaceLandmarkerPlugin :
     }
 
     private fun stopController(
+        source: String = NativeStopSource.UNKNOWN,
+        reason: String = "unknown",
         onComplete: (Map<String, Any>) -> Unit = {},
         onFailure: (String, String) -> Unit = { _, _ -> },
     ) {
@@ -540,7 +583,7 @@ class StraightFaceLandmarkerPlugin :
             }
             return
         }
-        active.stop { outcome ->
+        active.stop(source = source, reason = reason) { outcome ->
             lastMetrics = outcome.metrics
             if (controller === active) controller = null
             if (outcome.errorCode == null) {
@@ -579,7 +622,10 @@ class StraightFaceLandmarkerPlugin :
 
     private fun unregisterPreview(view: StraightFaceCameraPlatformView) {
         if (preview === view) {
-            stopController()
+            stopController(
+                source = NativeStopSource.PLATFORM_VIEW_DISPOSE,
+                reason = "platform_view_disposed",
+            )
             preview = null
         }
     }
@@ -587,6 +633,8 @@ class StraightFaceLandmarkerPlugin :
     private data class PendingStart(
         val sessionId: String,
         val result: MethodChannel.Result,
+        val dartStartAttempt: Long,
+        val dartLeaseGeneration: Long,
     )
 
     private data class PendingEvidenceSave(
